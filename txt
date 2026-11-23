@@ -1,905 +1,767 @@
 
-Model sentiment labels:
-{'positive': 0, 'negative': 1, 'neutral': 2}
-Model initialization completed in 2.34 seconds
+"""
+GOLD LAYER - FinTel Phase 4
+
+Inputs:
+    Stock Silver : Delta
+    News Silver  : Parquet
+
+Processing:
+    - Stock and news stream aggregation
+    - 5-minute windows
+    - 1-minute sliding interval
+    - 10-minute watermark
+    - Stream-stream LEFT OUTER JOIN
+    - Sentiment and stock price analysis
+    - Alert generation
+
+Outputs:
+    data/gold/sentiment_price
+    data/audit/gold_aggregation_audit.jsonl
+
+Optional:
+    PostgreSQL gold_sentiment_price
+"""
+
+from pyspark.sql import functions as F
+from pyspark.sql.streaming import StreamingQueryListener
+
+from common import audit
+from common.schemas import (
+    NEWS_BY_TICKER_DDL,
+    SILVER_TICKS_DDL
+)
+from common.tables import read_stream, write_batch
+from config import settings
+
+
+# =========================================================
+# CONSTANTS
+# =========================================================
+
+JOB = "gold_job"
+QUERY_NAME = "gold-sentiment-price"
+
+GOLD_COLUMNS = [
+    "window_start",
+    "window_end",
+    "symbol",
+    "article_count",
+    "avg_sentiment",
+    "min_sentiment",
+    "latest_headline",
+    "latest_sentiment_label",
+    "price_first",
+    "price_last",
+    "price_high",
+    "price_low",
+    "price_change_pct",
+    "price_range_pct",
+    "tick_count",
+    "day_change_pct",
+    "alert_flag",
+    "alert_reason",
+    "computed_at",
+]
+
+# batch_id -> (rows, min window_start, max window_end)
+_batch_outputs = {}
+
+
+# =========================================================
+# BUILD GOLD STREAM
+# =========================================================
+
+def build_gold_stream(ticks_raw, news_raw):
+    """
+    Build the Gold streaming DataFrame.
+
+    Stock:
+        Aggregate prices by symbol and time window.
+
+    News:
+        Aggregate sentiment by ticker and time window.
+
+    Join:
+        LEFT OUTER JOIN on symbol and matching window.
+    """
+
+    # -----------------------------------------------------
+    # 1. STOCK SILVER PROCESSING
+    # -----------------------------------------------------
+
+    ticks = (
+        ticks_raw
+        .where(F.col("current_price") > 0)
+        .where(F.col("publication_timestamp").isNotNull())
+        .select(
+            F.col("symbol"),
+            F.col("current_price").alias("price"),
+            F.col("change_percent"),
+            F.col("publication_timestamp").alias("tick_time")
+        )
+        .withWatermark(
+            "tick_time",
+            settings.WATERMARK
+        )
+    )
+
+    # -----------------------------------------------------
+    # 2. STOCK WINDOW AGGREGATION
+    # -----------------------------------------------------
+
+    tick_win = (
+        ticks
+        .groupBy(
+            F.col("symbol"),
+            F.window(
+                "tick_time",
+                settings.WINDOW_DURATION,
+                settings.SLIDE_DURATION
+            ).alias("w")
+        )
+        .agg(
+            F.min_by(
+                "price", "tick_time"
+            ).alias("price_first"),
+
+            F.max_by(
+                "price", "tick_time"
+            ).alias("price_last"),
+
+            F.max("price").alias("price_high"),
+
+            F.min("price").alias("price_low"),
+
+            F.count(
+                F.lit(1)
+            ).alias("tick_count"),
+
+            F.max_by(
+                "change_percent", "tick_time"
+            ).alias("day_change_pct")
+        )
+    )
+
+    # -----------------------------------------------------
+    # 3. NEWS SILVER PROCESSING
+    # -----------------------------------------------------
+
+    news = (
+        news_raw
+        .select(
+            "article_id",
+            F.col("ticker").alias("symbol"),
+            "headline",
+            "sentiment",
+            "sentiment_score",
+
+            F.try_to_timestamp(
+                F.col(settings.NEWS_TIME_COLUMN)
+            ).alias("news_time")
+        )
+        .where(
+            F.col("news_time").isNotNull()
+            & F.col("sentiment_score").isNotNull()
+            & F.col("symbol").isNotNull()
+        )
+        .withWatermark(
+            "news_time",
+            settings.WATERMARK
+        )
+    )
+
+    # -----------------------------------------------------
+    # 4. NEWS WINDOW AGGREGATION
+    # -----------------------------------------------------
+
+    news_win = (
+        news
+        .groupBy(
+            F.col("symbol").alias("n_symbol"),
+            F.window(
+                "news_time",
+                settings.WINDOW_DURATION,
+                settings.SLIDE_DURATION
+            ).alias("n_w")
+        )
+        .agg(
+            F.count(
+                F.lit(1)
+            ).alias("article_count"),
+
+            F.avg(
+                "sentiment_score"
+            ).alias("avg_sentiment"),
+
+            F.min(
+                "sentiment_score"
+            ).alias("min_sentiment"),
+
+            F.max_by(
+                "headline", "news_time"
+            ).alias("latest_headline"),
+
+            F.max_by(
+                "sentiment", "news_time"
+            ).alias("latest_sentiment_label")
+        )
+    )
+
+    # -----------------------------------------------------
+    # 5. STREAM-STREAM LEFT OUTER JOIN
+    # -----------------------------------------------------
+
+    joined = tick_win.join(
+        news_win,
+
+        (
+            F.col("symbol") == F.col("n_symbol")
+        )
+        &
+        (
+            F.col("w") == F.col("n_w")
+        ),
+
+        "leftOuter"
+    )
+
+    # -----------------------------------------------------
+    # 6. PRICE CHANGE CALCULATION
+    # -----------------------------------------------------
+
+    change = (
+        (
+            F.col("price_last")
+            - F.col("price_first")
+        )
+        / F.col("price_first")
+        * 100
+    )
+
+    bad_sentiment = (
+        F.col("avg_sentiment")
+        <= F.lit(settings.ALERT_SENTIMENT_THRESHOLD)
+    )
+
+    price_drop = (
+        change
+        <= F.lit(settings.ALERT_PRICE_DROP_PCT)
+    )
+
+    # -----------------------------------------------------
+    # 7. GOLD FINAL OUTPUT
+    # -----------------------------------------------------
+
+    gold = (
+        joined
+        .select(
+            F.col("w.start").alias("window_start"),
+            F.col("w.end").alias("window_end"),
+
+            F.col("symbol"),
+
+            F.coalesce(
+                F.col("article_count"),
+                F.lit(0)
+            ).cast("int").alias("article_count"),
+
+            F.col("avg_sentiment"),
+            F.col("min_sentiment"),
+
+            F.col("latest_headline"),
+            F.col("latest_sentiment_label"),
+
+            F.col("price_first"),
+            F.col("price_last"),
+            F.col("price_high"),
+            F.col("price_low"),
+
+            change.alias("price_change_pct"),
+
+            (
+                (
+                    F.col("price_high")
+                    - F.col("price_low")
+                )
+                / F.col("price_first")
+                * 100
+            ).alias("price_range_pct"),
+
+            F.col("tick_count").cast("long").alias("tick_count"),
+
+            F.col("day_change_pct")
+        )
+
+        .withColumn(
+            "price_change_pct",
+            F.round("price_change_pct", 4)
+        )
+
+        .withColumn(
+            "price_range_pct",
+            F.round("price_range_pct", 4)
+        )
+
+        .withColumn(
+            "alert_flag",
+            F.coalesce(
+                bad_sentiment,
+                F.lit(False)
+            )
+        )
+
+        .withColumn(
+            "alert_reason",
+
+            F.when(
+                bad_sentiment & price_drop,
+
+                F.concat(
+                    F.lit("negative sentiment ("),
+
+                    F.round(
+                        "avg_sentiment", 2
+                    ).cast("string"),
+
+                    F.lit(") with price drop ("),
+
+                    F.round(
+                        "price_change_pct", 2
+                    ).cast("string"),
+
+                    F.lit("%)")
+                )
+            )
+
+            .when(
+                bad_sentiment,
+
+                F.concat(
+                    F.lit("negative sentiment ("),
+
+                    F.round(
+                        "avg_sentiment", 2
+                    ).cast("string"),
+
+                    F.lit("), price not yet reacting")
+                )
+            )
+        )
+
+        .withColumn(
+            "computed_at",
+            F.current_timestamp()
+        )
+
+        .select(*GOLD_COLUMNS)
+    )
+
+    return gold
+
+
+# =========================================================
+# GOLD PROGRESS AUDIT
+# =========================================================
+
+class GoldProgressAudit(StreamingQueryListener):
+    """
+    Writes one Gold audit record per streaming trigger.
+    """
+
+    def __init__(self, run_id):
+        super().__init__()
+        self.run_id = run_id
+
+    def onQueryStarted(self, event):
+        pass
+
+    def onQueryIdle(self, event):
+        pass
+
+    def onQueryTerminated(self, event):
+        pass
+
+    def onQueryProgress(self, event):
+
+        p = event.progress
+
+        if p.name != QUERY_NAME:
+            return
+
+        news_in = 0
+        tick_in = 0
+
+        for source in p.sources:
+
+            desc = str(source.description)
+
+            if "news_by_ticker" in desc:
+                news_in += int(source.numInputRows or 0)
+            else:
+                tick_in += int(source.numInputRows or 0)
+
+        late = sum(
+            int(
+                getattr(
+                    op,
+                    "numRowsDroppedByWatermark",
+                    0
+                ) or 0
+            )
+            for op in p.stateOperators
+        )
+
+        rows, wmin, wmax = _batch_outputs.pop(
+            p.batchId,
+            (0, None, None)
+        )
+
+        audit.write_audit(
+            "gold_aggregation_audit",
+
+            {
+                "run_id": self.run_id,
+                "job_name": JOB,
+                "batch_id": int(p.batchId),
+
+                "window_start_min": wmin,
+                "window_end_max": wmax,
+
+                "input_news_count": news_in,
+                "input_tick_count": tick_in,
+
+                "output_row_count": rows,
+                "late_records": late,
+
+                "duration_ms": int(
+                    (p.durationMs or {}).get(
+                        "triggerExecution", 0
+                    )
+                ),
+
+                "status": "OK"
+            }
+        )
+
+
+# =========================================================
+# OPTIONAL POSTGRES UPSERT
+# =========================================================
+
+def _postgres_upsert(rows):
+
+    import psycopg2
+
+    con = psycopg2.connect(
+        host=settings.PG_HOST,
+        port=settings.PG_PORT,
+        dbname=settings.PG_DB,
+        user=settings.PG_USER,
+        password=settings.PG_PASSWORD,
+        connect_timeout=5
+    )
+
+    cols = GOLD_COLUMNS
+
+    sets = ", ".join(
+        f"{c}=EXCLUDED.{c}"
+        for c in cols
+        if c not in (
+            "window_start",
+            "symbol"
+        )
+    )
+
+    with con, con.cursor() as cur:
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gold_sentiment_price (
+
+                window_start TIMESTAMPTZ NOT NULL,
+                window_end TIMESTAMPTZ,
+                symbol TEXT NOT NULL,
+
+                article_count INT,
+                avg_sentiment DOUBLE PRECISION,
+                min_sentiment DOUBLE PRECISION,
+
+                latest_headline TEXT,
+                latest_sentiment_label TEXT,
+
+                price_first DOUBLE PRECISION,
+                price_last DOUBLE PRECISION,
+                price_high DOUBLE PRECISION,
+                price_low DOUBLE PRECISION,
+
+                price_change_pct DOUBLE PRECISION,
+                price_range_pct DOUBLE PRECISION,
+
+                tick_count BIGINT,
+                day_change_pct DOUBLE PRECISION,
+
+                alert_flag BOOLEAN,
+                alert_reason TEXT,
+
+                computed_at TIMESTAMPTZ,
+
+                PRIMARY KEY (window_start, symbol)
+            )
+            """
+        )
+
+        for r in rows:
+
+            cur.execute(
+                f"""
+                INSERT INTO gold_sentiment_price
+                ({','.join(cols)})
+                VALUES ({','.join(['%s'] * len(cols))})
+
+                ON CONFLICT (window_start, symbol)
+                DO UPDATE SET {sets}
+                """,
+
+                [r[c] for c in cols]
+            )
+
+    con.close()
+
+
+# =========================================================
+# START GOLD STREAMING JOB
+# =========================================================
+
+def start_gold(spark, run_id):
+
+    # -----------------------------------------------------
+    # 1. VALIDATE STOCK SILVER PATH
+    # -----------------------------------------------------
+
+    if not settings.SILVER_TICKS_PATH.exists():
+
+        raise FileNotFoundError(
+            f"Stock Silver path not found: "
+            f"{settings.SILVER_TICKS_PATH}"
+        )
+
+    # -----------------------------------------------------
+    # 2. READ STOCK SILVER DELTA
+    # -----------------------------------------------------
+
+    ticks_raw = read_stream(
+        spark,
+
+        settings.SILVER_TICKS_PATH,
+
+        SILVER_TICKS_DDL,
+
+        fmt=settings.SILVER_TICKS_FORMAT,
+
+        options={
+            "maxFilesPerTrigger": "50"
+        }
+    )
+
+    # -----------------------------------------------------
+    # 3. VALIDATE NEWS SILVER PATH
+    # -----------------------------------------------------
+
+    if not settings.SILVER_NEWS_BY_TICKER_PATH.exists():
+
+        raise FileNotFoundError(
+            f"News Silver path not found: "
+            f"{settings.SILVER_NEWS_BY_TICKER_PATH}"
+        )
+
+    # -----------------------------------------------------
+    # 4. READ NEWS SILVER PARQUET
+    # -----------------------------------------------------
+
+    news_raw = read_stream(
+        spark,
+
+        settings.SILVER_NEWS_BY_TICKER_PATH,
+
+        NEWS_BY_TICKER_DDL,
+
+        fmt=settings.SILVER_NEWS_FORMAT,
+
+        options={
+            "recursiveFileLookup": str(
+                settings.SILVER_NEWS_RECURSIVE_LOOKUP
+            ).lower(),
+
+            "maxFilesPerTrigger": "50"
+        }
+    )
+
+    print("\n[GOLD] INPUT CONFIGURATION")
+
+    print(
+        "[GOLD] Stock Silver:",
+        settings.SILVER_TICKS_PATH
+    )
 
-========== CHECKPOINT RECOVERY ==========
-Committed batches recovered: 13
-Processed Bronze files: 29
-Processed article IDs: 57
-Checkpoint recovery completed.
-
-Service is running. Monitoring Bronze for new Parquet files.
-Press Ctrl+C to stop the service gracefully.
+    print(
+        "[GOLD] Stock format:",
+        settings.SILVER_TICKS_FORMAT
+    )
+
+    print(
+        "[GOLD] News Silver:",
+        settings.SILVER_NEWS_BY_TICKER_PATH
+    )
+
+    print(
+        "[GOLD] News format:",
+        settings.SILVER_NEWS_FORMAT
+    )
+
+    print(
+        "[GOLD] News event-time column:",
+        settings.NEWS_TIME_COLUMN
+    )
 
-
-Detected 2 new Bronze file(s). Checking file stability...
-
-
-================================================
-          STARTING SILVER NEWS BATCH
-================================================
-
-========== STEP 1: CHECKPOINT RECOVERY ==========
-
-========== CHECKPOINT RECOVERY ==========
-Committed batches recovered: 13
-Processed Bronze files: 29
-Processed article IDs: 57
-Checkpoint recovery completed.
-
-========== STEP 2: READ BRONZE ==========
-
-========== INCREMENTAL FILE CHECK ==========
-Total Bronze files: 14
-Previously processed files: 29
-New files to process: 2
-NEW: news_20261123T094045543120Z_3120ff53.parquet
-NEW: news_20261123T094045689772Z_52f3e827.parquet
-SKIPPED: news_20261118T062018498715Z_0678ba20.parquet
-SKIPPED: news_20261118T062018665286Z_11170060.parquet
-SKIPPED: news_20261119T065518299142Z_85c25b66.parquet
-SKIPPED: news_20261119T065518393195Z_2af22eaa.parquet
-SKIPPED: news_20261119T104533345690Z_d4cd305a.parquet
-SKIPPED: news_20261122T183624211207Z_798c195a.parquet
-SKIPPED: news_20261122T185131806721Z_10addeb7.parquet
-SKIPPED: news_20261123T051958242442Z_97443a77.parquet
-SKIPPED: news_20261123T051958321999Z_e64d1a5e.parquet
-SKIPPED: news_20261123T053521596007Z_890b5b1e.parquet
-SKIPPED: news_20261123T060610866827Z_fef97af4.parquet
-SKIPPED: news_20261123T062127085026Z_d0eceb64.parquet
-
-Reading: news_20261123T094045543120Z_3120ff53.parquet
-Records in file: 1
-
-Reading: news_20261123T094045689772Z_52f3e827.parquet
-Records in file: 1
-
-Total new Bronze records: 2
-New Bronze files: 2
- - news_20261123T094045543120Z_3120ff53.parquet
- - news_20261123T094045689772Z_52f3e827.parquet
-
-Batch ID: batch_3d6ef9aef0c2fd27
-
-========== STEP 3: EXACT DEDUPLICATION ==========
-
-========== ARTICLE-LEVEL DEDUPLICATION ==========
-Previously processed article IDs: 57
-
-Exact article-level deduplication transformations prepared.
-Previously processed IDs: 57
-Article-level deduplication completed!
-Records proceeding to validation: 2                                             
-
-========== STEP 4: VALIDATION ==========
-
-========== STARTING NEWS VALIDATION ==========
-
-Validation transformations completed; valid and invalid records are separated.
-Valid articles: 2                                                               
-Invalid articles: 0
-
-========== STEP 5: HTML CLEANING ==========
-
-========== STARTING HTML CLEANING ==========
-HTML cleaning completed.
-
-========== STEP 6: TICKER EXTRACTION ==========
-
-========== STARTING TICKER EXTRACTION ==========
-Number of companies loaded: 13
-Ticker extraction transformations prepared.
-
-========== STEP 7: SEMANTIC DEDUPLICATION ==========
-
-========== SEMANTIC DEDUPLICATION ==========
-
-Loading historical Silver News...
-Reading historical file: part-00000.parquet
-Reading historical file: part-00000.parquet
-Reading historical file: part-00000.parquet
-Reading historical file: part-00000.parquet
-Reading historical file: part-00000.parquet
-Reading historical file: part-00000.parquet
-Reading historical file: part-00000.parquet
-Reading historical file: part-00000.parquet
-Reading historical file: part-00000.parquet
-Reading historical file: part-00000.parquet
-Reading historical file: part-00000.parquet
-Reading historical file: part-00000.parquet
-Reading historical file: part-00000.parquet
-Historical articles loaded: 56
-
-Preparing semantic comparison candidates...
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with 56aada9705765e4794ec70c2b3b80f8c3b3d67c2ffcb21227912835a2c26cc6a: 0.6871
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with 6e531a79a4b54d65abc6a0686211b7e17bbf3a074d72e5eb3a9e9db0c48008ea: 0.6195
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with 0734e0f33691fcb3fc842e8dfafc27592f0e5487452edeed52294bf1155617d4: 0.6149
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with 22d5628d2d11b697abc811a32011b9abccd26edcc0ff490fd339ebc5d011db39: 0.7254
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with bf0736d15cc8e4e7764a8084d70c5a9c876915172a598ec5a0726028f226641e: 0.3780
-
-SEMANTIC DUPLICATE DETECTED: a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176
-Canonical article: 22d5628d2d11b697abc811a32011b9abccd26edcc0ff490fd339ebc5d011db39
-Similarity: 0.7254
-Duplicate headline: Tata Steel targets 15 million tonne downstream capacity after APL Apollo deal; analysts flag risks - CNBC TV18
-Canonical headline: Jamshedpur news:Tata Steel and Promoters of APL Apollo Enter into a Comprehensive Agreement to Build an Indian Steel Tubes and Colour Coated Products Powerhouse Targeting 15.5 Million Tonnes of Capacity - Bihar Jharkhand News Network
-Matched ticker(s): TATASTEEL
-Reason: Middle-zone event duplicate: shared ticker, within 24-hour window, cosine similarity 0.70-0.85, and shared event-context terms: apl, apollo, capacity, million, steel, tata
-
-UNIQUE ARTICLE: b1797a61220e3285f96a2020d793d9e9b3bebb514baa5ccf3f68a6e47992cbc8
-
-================================================
-          SILVER NEWS BATCH FAILED
-================================================
-Error: [FIELD_DATA_TYPE_UNACCEPTABLE_WITH_NAME] field time_window_hours: DoubleType() can not accept object 24 in type <class 'int'>.
-
-========== EXECUTION TIME SUMMARY ==========
-Checkpoint Recovery           :      0.03 seconds
-Read Bronze                   :      8.04 seconds
-Exact Deduplication           :      1.00 seconds
-Collect candidate IDs         :     30.82 seconds
-Validation                    :      0.60 seconds
-Valid record count action     :      3.37 seconds
-Invalid record count action   :      1.69 seconds
-HTML Cleaning                 :      0.46 seconds
-Ticker Extraction             :      0.46 seconds
-Semantic Deduplication        :      3.59 seconds
-TOTAL BATCH TIME              :     54.26 seconds
-============================================
-
-Batch failed; files remain uncheckpointed and will be retried.
-Retrying after 15 seconds. Error: [FIELD_DATA_TYPE_UNACCEPTABLE_WITH_NAME] field time_window_hours: DoubleType() can not accept object 24 in type <class 'int'>.
-
-Detected 2 new Bronze file(s). Checking file stability...
-
-
-================================================
-          STARTING SILVER NEWS BATCH
-================================================
-
-========== STEP 1: CHECKPOINT RECOVERY ==========
-
-========== CHECKPOINT RECOVERY ==========
-Committed batches recovered: 13
-Processed Bronze files: 29
-Processed article IDs: 57
-Checkpoint recovery completed.
-
-========== STEP 2: READ BRONZE ==========
-
-========== INCREMENTAL FILE CHECK ==========
-Total Bronze files: 14
-Previously processed files: 29
-New files to process: 2
-NEW: news_20261123T094045543120Z_3120ff53.parquet
-NEW: news_20261123T094045689772Z_52f3e827.parquet
-SKIPPED: news_20261118T062018498715Z_0678ba20.parquet
-SKIPPED: news_20261118T062018665286Z_11170060.parquet
-SKIPPED: news_20261119T065518299142Z_85c25b66.parquet
-SKIPPED: news_20261119T065518393195Z_2af22eaa.parquet
-SKIPPED: news_20261119T104533345690Z_d4cd305a.parquet
-SKIPPED: news_20261122T183624211207Z_798c195a.parquet
-SKIPPED: news_20261122T185131806721Z_10addeb7.parquet
-SKIPPED: news_20261123T051958242442Z_97443a77.parquet
-SKIPPED: news_20261123T051958321999Z_e64d1a5e.parquet
-SKIPPED: news_20261123T053521596007Z_890b5b1e.parquet
-SKIPPED: news_20261123T060610866827Z_fef97af4.parquet
-SKIPPED: news_20261123T062127085026Z_d0eceb64.parquet
-
-Reading: news_20261123T094045543120Z_3120ff53.parquet
-Records in file: 1
-
-Reading: news_20261123T094045689772Z_52f3e827.parquet
-Records in file: 1
-
-Total new Bronze records: 2
-New Bronze files: 2
- - news_20261123T094045543120Z_3120ff53.parquet
- - news_20261123T094045689772Z_52f3e827.parquet
-
-Batch ID: batch_3d6ef9aef0c2fd27
-
-========== STEP 3: EXACT DEDUPLICATION ==========
-
-========== ARTICLE-LEVEL DEDUPLICATION ==========
-Previously processed article IDs: 57
-
-Exact article-level deduplication transformations prepared.
-Previously processed IDs: 57
-Article-level deduplication completed!
-Records proceeding to validation: 2                                             
-
-========== STEP 4: VALIDATION ==========
-
-========== STARTING NEWS VALIDATION ==========
-
-Validation transformations completed; valid and invalid records are separated.
-Valid articles: 2
-Invalid articles: 0
-
-========== STEP 5: HTML CLEANING ==========
-
-========== STARTING HTML CLEANING ==========
-HTML cleaning completed.
-
-========== STEP 6: TICKER EXTRACTION ==========
-
-========== STARTING TICKER EXTRACTION ==========
-Number of companies loaded: 13
-Ticker extraction transformations prepared.
-
-========== STEP 7: SEMANTIC DEDUPLICATION ==========
-
-========== SEMANTIC DEDUPLICATION ==========
-Reusing in-memory historical Silver News cache: 56
-
-Preparing semantic comparison candidates...
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with 56aada9705765e4794ec70c2b3b80f8c3b3d67c2ffcb21227912835a2c26cc6a: 0.6871
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with 6e531a79a4b54d65abc6a0686211b7e17bbf3a074d72e5eb3a9e9db0c48008ea: 0.6195
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with 0734e0f33691fcb3fc842e8dfafc27592f0e5487452edeed52294bf1155617d4: 0.6149
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with 22d5628d2d11b697abc811a32011b9abccd26edcc0ff490fd339ebc5d011db39: 0.7254
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with bf0736d15cc8e4e7764a8084d70c5a9c876915172a598ec5a0726028f226641e: 0.3780
-
-SEMANTIC DUPLICATE DETECTED: a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176
-Canonical article: 22d5628d2d11b697abc811a32011b9abccd26edcc0ff490fd339ebc5d011db39
-Similarity: 0.7254
-Duplicate headline: Tata Steel targets 15 million tonne downstream capacity after APL Apollo deal; analysts flag risks - CNBC TV18
-Canonical headline: Jamshedpur news:Tata Steel and Promoters of APL Apollo Enter into a Comprehensive Agreement to Build an Indian Steel Tubes and Colour Coated Products Powerhouse Targeting 15.5 Million Tonnes of Capacity - Bihar Jharkhand News Network
-Matched ticker(s): TATASTEEL
-Reason: Middle-zone event duplicate: shared ticker, within 24-hour window, cosine similarity 0.70-0.85, and shared event-context terms: apl, apollo, capacity, million, steel, tata
-
-UNIQUE ARTICLE: b1797a61220e3285f96a2020d793d9e9b3bebb514baa5ccf3f68a6e47992cbc8
-
-================================================
-          SILVER NEWS BATCH FAILED
-================================================
-Error: [FIELD_DATA_TYPE_UNACCEPTABLE_WITH_NAME] field time_window_hours: DoubleType() can not accept object 24 in type <class 'int'>.
-
-========== EXECUTION TIME SUMMARY ==========
-Checkpoint Recovery           :      0.06 seconds
-Read Bronze                   :      0.44 seconds
-Exact Deduplication           :      0.57 seconds
-Collect candidate IDs         :     28.73 seconds
-Validation                    :      0.33 seconds
-Valid record count action     :      0.85 seconds
-Invalid record count action   :      1.06 seconds
-HTML Cleaning                 :      0.35 seconds
-Ticker Extraction             :      0.26 seconds
-Semantic Deduplication        :      1.31 seconds
-TOTAL BATCH TIME              :     34.79 seconds
-============================================
-
-Batch failed; files remain uncheckpointed and will be retried.
-Retrying after 15 seconds. Error: [FIELD_DATA_TYPE_UNACCEPTABLE_WITH_NAME] field time_window_hours: DoubleType() can not accept object 24 in type <class 'int'>.
-
-Detected 2 new Bronze file(s). Checking file stability...
-
-
-================================================
-          STARTING SILVER NEWS BATCH
-================================================
-
-========== STEP 1: CHECKPOINT RECOVERY ==========
-
-========== CHECKPOINT RECOVERY ==========
-Committed batches recovered: 13
-Processed Bronze files: 29
-Processed article IDs: 57
-Checkpoint recovery completed.
-
-========== STEP 2: READ BRONZE ==========
-
-========== INCREMENTAL FILE CHECK ==========
-Total Bronze files: 14
-Previously processed files: 29
-New files to process: 2
-NEW: news_20261123T094045543120Z_3120ff53.parquet
-NEW: news_20261123T094045689772Z_52f3e827.parquet
-SKIPPED: news_20261118T062018498715Z_0678ba20.parquet
-SKIPPED: news_20261118T062018665286Z_11170060.parquet
-SKIPPED: news_20261119T065518299142Z_85c25b66.parquet
-SKIPPED: news_20261119T065518393195Z_2af22eaa.parquet
-SKIPPED: news_20261119T104533345690Z_d4cd305a.parquet
-SKIPPED: news_20261122T183624211207Z_798c195a.parquet
-SKIPPED: news_20261122T185131806721Z_10addeb7.parquet
-SKIPPED: news_20261123T051958242442Z_97443a77.parquet
-SKIPPED: news_20261123T051958321999Z_e64d1a5e.parquet
-SKIPPED: news_20261123T053521596007Z_890b5b1e.parquet
-SKIPPED: news_20261123T060610866827Z_fef97af4.parquet
-SKIPPED: news_20261123T062127085026Z_d0eceb64.parquet
-
-Reading: news_20261123T094045543120Z_3120ff53.parquet
-Records in file: 1
-
-Reading: news_20261123T094045689772Z_52f3e827.parquet
-Records in file: 1
-
-Total new Bronze records: 2
-New Bronze files: 2
- - news_20261123T094045543120Z_3120ff53.parquet
- - news_20261123T094045689772Z_52f3e827.parquet
-
-Batch ID: batch_3d6ef9aef0c2fd27
-
-========== STEP 3: EXACT DEDUPLICATION ==========
-
-========== ARTICLE-LEVEL DEDUPLICATION ==========
-Previously processed article IDs: 57
-
-Exact article-level deduplication transformations prepared.
-Previously processed IDs: 57
-Article-level deduplication completed!
-Records proceeding to validation: 2                                             
-
-========== STEP 4: VALIDATION ==========
-
-========== STARTING NEWS VALIDATION ==========
-
-Validation transformations completed; valid and invalid records are separated.
-Valid articles: 2
-Invalid articles: 0
-
-========== STEP 5: HTML CLEANING ==========
-
-========== STARTING HTML CLEANING ==========
-HTML cleaning completed.
-
-========== STEP 6: TICKER EXTRACTION ==========
-
-========== STARTING TICKER EXTRACTION ==========
-Number of companies loaded: 13
-Ticker extraction transformations prepared.
-
-========== STEP 7: SEMANTIC DEDUPLICATION ==========
-
-========== SEMANTIC DEDUPLICATION ==========
-Reusing in-memory historical Silver News cache: 56
-
-Preparing semantic comparison candidates...
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with 56aada9705765e4794ec70c2b3b80f8c3b3d67c2ffcb21227912835a2c26cc6a: 0.6871
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with 6e531a79a4b54d65abc6a0686211b7e17bbf3a074d72e5eb3a9e9db0c48008ea: 0.6195
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with 0734e0f33691fcb3fc842e8dfafc27592f0e5487452edeed52294bf1155617d4: 0.6149
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with 22d5628d2d11b697abc811a32011b9abccd26edcc0ff490fd339ebc5d011db39: 0.7254
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with bf0736d15cc8e4e7764a8084d70c5a9c876915172a598ec5a0726028f226641e: 0.3780
-
-SEMANTIC DUPLICATE DETECTED: a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176
-Canonical article: 22d5628d2d11b697abc811a32011b9abccd26edcc0ff490fd339ebc5d011db39
-Similarity: 0.7254
-Duplicate headline: Tata Steel targets 15 million tonne downstream capacity after APL Apollo deal; analysts flag risks - CNBC TV18
-Canonical headline: Jamshedpur news:Tata Steel and Promoters of APL Apollo Enter into a Comprehensive Agreement to Build an Indian Steel Tubes and Colour Coated Products Powerhouse Targeting 15.5 Million Tonnes of Capacity - Bihar Jharkhand News Network
-Matched ticker(s): TATASTEEL
-Reason: Middle-zone event duplicate: shared ticker, within 24-hour window, cosine similarity 0.70-0.85, and shared event-context terms: apl, apollo, capacity, million, steel, tata
-
-UNIQUE ARTICLE: b1797a61220e3285f96a2020d793d9e9b3bebb514baa5ccf3f68a6e47992cbc8
-
-================================================
-          SILVER NEWS BATCH FAILED
-================================================
-Error: [FIELD_DATA_TYPE_UNACCEPTABLE_WITH_NAME] field time_window_hours: DoubleType() can not accept object 24 in type <class 'int'>.
-
-========== EXECUTION TIME SUMMARY ==========
-Checkpoint Recovery           :      0.11 seconds
-Read Bronze                   :      0.31 seconds
-Exact Deduplication           :      0.41 seconds
-Collect candidate IDs         :     22.85 seconds
-Validation                    :      0.30 seconds
-Valid record count action     :      1.18 seconds
-Invalid record count action   :      0.77 seconds
-HTML Cleaning                 :      0.45 seconds
-Ticker Extraction             :      0.26 seconds
-Semantic Deduplication        :      1.37 seconds
-TOTAL BATCH TIME              :     29.03 seconds
-============================================
-
-Batch failed; files remain uncheckpointed and will be retried.
-Retrying after 15 seconds. Error: [FIELD_DATA_TYPE_UNACCEPTABLE_WITH_NAME] field time_window_hours: DoubleType() can not accept object 24 in type <class 'int'>.
-
-Detected 2 new Bronze file(s). Checking file stability...
-
-
-================================================
-          STARTING SILVER NEWS BATCH
-================================================
-
-========== STEP 1: CHECKPOINT RECOVERY ==========
-
-========== CHECKPOINT RECOVERY ==========
-Committed batches recovered: 13
-Processed Bronze files: 29
-Processed article IDs: 57
-Checkpoint recovery completed.
-
-========== STEP 2: READ BRONZE ==========
-
-========== INCREMENTAL FILE CHECK ==========
-Total Bronze files: 14
-Previously processed files: 29
-New files to process: 2
-NEW: news_20261123T094045543120Z_3120ff53.parquet
-NEW: news_20261123T094045689772Z_52f3e827.parquet
-SKIPPED: news_20261118T062018498715Z_0678ba20.parquet
-SKIPPED: news_20261118T062018665286Z_11170060.parquet
-SKIPPED: news_20261119T065518299142Z_85c25b66.parquet
-SKIPPED: news_20261119T065518393195Z_2af22eaa.parquet
-SKIPPED: news_20261119T104533345690Z_d4cd305a.parquet
-SKIPPED: news_20261122T183624211207Z_798c195a.parquet
-SKIPPED: news_20261122T185131806721Z_10addeb7.parquet
-SKIPPED: news_20261123T051958242442Z_97443a77.parquet
-SKIPPED: news_20261123T051958321999Z_e64d1a5e.parquet
-SKIPPED: news_20261123T053521596007Z_890b5b1e.parquet
-SKIPPED: news_20261123T060610866827Z_fef97af4.parquet
-SKIPPED: news_20261123T062127085026Z_d0eceb64.parquet
-
-Reading: news_20261123T094045543120Z_3120ff53.parquet
-Records in file: 1
-
-Reading: news_20261123T094045689772Z_52f3e827.parquet
-Records in file: 1
-
-Total new Bronze records: 2
-New Bronze files: 2
- - news_20261123T094045543120Z_3120ff53.parquet
- - news_20261123T094045689772Z_52f3e827.parquet
-
-Batch ID: batch_3d6ef9aef0c2fd27
-
-========== STEP 3: EXACT DEDUPLICATION ==========
-
-========== ARTICLE-LEVEL DEDUPLICATION ==========
-Previously processed article IDs: 57
-
-Exact article-level deduplication transformations prepared.
-Previously processed IDs: 57
-Article-level deduplication completed!
-Records proceeding to validation: 2                                             
-
-========== STEP 4: VALIDATION ==========
-
-========== STARTING NEWS VALIDATION ==========
-
-Validation transformations completed; valid and invalid records are separated.
-Valid articles: 2
-Invalid articles: 0
-
-========== STEP 5: HTML CLEANING ==========
-
-========== STARTING HTML CLEANING ==========
-HTML cleaning completed.
-
-========== STEP 6: TICKER EXTRACTION ==========
-
-========== STARTING TICKER EXTRACTION ==========
-Number of companies loaded: 13
-Ticker extraction transformations prepared.
-
-========== STEP 7: SEMANTIC DEDUPLICATION ==========
-
-========== SEMANTIC DEDUPLICATION ==========
-Reusing in-memory historical Silver News cache: 56
-
-Preparing semantic comparison candidates...
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with 56aada9705765e4794ec70c2b3b80f8c3b3d67c2ffcb21227912835a2c26cc6a: 0.6871
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with 6e531a79a4b54d65abc6a0686211b7e17bbf3a074d72e5eb3a9e9db0c48008ea: 0.6195
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with 0734e0f33691fcb3fc842e8dfafc27592f0e5487452edeed52294bf1155617d4: 0.6149
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with 22d5628d2d11b697abc811a32011b9abccd26edcc0ff490fd339ebc5d011db39: 0.7254
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with bf0736d15cc8e4e7764a8084d70c5a9c876915172a598ec5a0726028f226641e: 0.3780
-
-SEMANTIC DUPLICATE DETECTED: a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176
-Canonical article: 22d5628d2d11b697abc811a32011b9abccd26edcc0ff490fd339ebc5d011db39
-Similarity: 0.7254
-Duplicate headline: Tata Steel targets 15 million tonne downstream capacity after APL Apollo deal; analysts flag risks - CNBC TV18
-Canonical headline: Jamshedpur news:Tata Steel and Promoters of APL Apollo Enter into a Comprehensive Agreement to Build an Indian Steel Tubes and Colour Coated Products Powerhouse Targeting 15.5 Million Tonnes of Capacity - Bihar Jharkhand News Network
-Matched ticker(s): TATASTEEL
-Reason: Middle-zone event duplicate: shared ticker, within 24-hour window, cosine similarity 0.70-0.85, and shared event-context terms: apl, apollo, capacity, million, steel, tata
-
-UNIQUE ARTICLE: b1797a61220e3285f96a2020d793d9e9b3bebb514baa5ccf3f68a6e47992cbc8
-
-================================================
-          SILVER NEWS BATCH FAILED
-================================================
-Error: [FIELD_DATA_TYPE_UNACCEPTABLE_WITH_NAME] field time_window_hours: DoubleType() can not accept object 24 in type <class 'int'>.
-
-========== EXECUTION TIME SUMMARY ==========
-Checkpoint Recovery           :      0.04 seconds
-Read Bronze                   :      0.23 seconds
-Exact Deduplication           :      0.28 seconds
-Collect candidate IDs         :     21.78 seconds
-Validation                    :      0.29 seconds
-Valid record count action     :      0.64 seconds
-Invalid record count action   :      0.55 seconds
-HTML Cleaning                 :      0.29 seconds
-Ticker Extraction             :      0.21 seconds
-Semantic Deduplication        :      0.94 seconds
-TOTAL BATCH TIME              :     25.60 seconds
-============================================
-
-Batch failed; files remain uncheckpointed and will be retried.
-Retrying after 15 seconds. Error: [FIELD_DATA_TYPE_UNACCEPTABLE_WITH_NAME] field time_window_hours: DoubleType() can not accept object 24 in type <class 'int'>.
-
-Detected 2 new Bronze file(s). Checking file stability...
-
-
-================================================
-          STARTING SILVER NEWS BATCH
-================================================
-
-========== STEP 1: CHECKPOINT RECOVERY ==========
-
-========== CHECKPOINT RECOVERY ==========
-Committed batches recovered: 13
-Processed Bronze files: 29
-Processed article IDs: 57
-Checkpoint recovery completed.
-
-========== STEP 2: READ BRONZE ==========
-
-========== INCREMENTAL FILE CHECK ==========
-Total Bronze files: 14
-Previously processed files: 29
-New files to process: 2
-NEW: news_20261123T094045543120Z_3120ff53.parquet
-NEW: news_20261123T094045689772Z_52f3e827.parquet
-SKIPPED: news_20261118T062018498715Z_0678ba20.parquet
-SKIPPED: news_20261118T062018665286Z_11170060.parquet
-SKIPPED: news_20261119T065518299142Z_85c25b66.parquet
-SKIPPED: news_20261119T065518393195Z_2af22eaa.parquet
-SKIPPED: news_20261119T104533345690Z_d4cd305a.parquet
-SKIPPED: news_20261122T183624211207Z_798c195a.parquet
-SKIPPED: news_20261122T185131806721Z_10addeb7.parquet
-SKIPPED: news_20261123T051958242442Z_97443a77.parquet
-SKIPPED: news_20261123T051958321999Z_e64d1a5e.parquet
-SKIPPED: news_20261123T053521596007Z_890b5b1e.parquet
-SKIPPED: news_20261123T060610866827Z_fef97af4.parquet
-SKIPPED: news_20261123T062127085026Z_d0eceb64.parquet
-
-Reading: news_20261123T094045543120Z_3120ff53.parquet
-Records in file: 1
-
-Reading: news_20261123T094045689772Z_52f3e827.parquet
-Records in file: 1
-
-Total new Bronze records: 2
-New Bronze files: 2
- - news_20261123T094045543120Z_3120ff53.parquet
- - news_20261123T094045689772Z_52f3e827.parquet
-
-Batch ID: batch_3d6ef9aef0c2fd27
-
-========== STEP 3: EXACT DEDUPLICATION ==========
-
-========== ARTICLE-LEVEL DEDUPLICATION ==========
-Previously processed article IDs: 57
-
-Exact article-level deduplication transformations prepared.
-Previously processed IDs: 57
-Article-level deduplication completed!
-Records proceeding to validation: 2                                             
-
-========== STEP 4: VALIDATION ==========
-
-========== STARTING NEWS VALIDATION ==========
-
-Validation transformations completed; valid and invalid records are separated.
-Valid articles: 2
-Invalid articles: 0
-
-========== STEP 5: HTML CLEANING ==========
-
-========== STARTING HTML CLEANING ==========
-HTML cleaning completed.
-
-========== STEP 6: TICKER EXTRACTION ==========
-
-========== STARTING TICKER EXTRACTION ==========
-Number of companies loaded: 13
-Ticker extraction transformations prepared.
-
-========== STEP 7: SEMANTIC DEDUPLICATION ==========
-
-========== SEMANTIC DEDUPLICATION ==========
-Reusing in-memory historical Silver News cache: 56
-
-Preparing semantic comparison candidates...
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with 56aada9705765e4794ec70c2b3b80f8c3b3d67c2ffcb21227912835a2c26cc6a: 0.6871
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with 6e531a79a4b54d65abc6a0686211b7e17bbf3a074d72e5eb3a9e9db0c48008ea: 0.6195
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with 0734e0f33691fcb3fc842e8dfafc27592f0e5487452edeed52294bf1155617d4: 0.6149
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with 22d5628d2d11b697abc811a32011b9abccd26edcc0ff490fd339ebc5d011db39: 0.7254
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with bf0736d15cc8e4e7764a8084d70c5a9c876915172a598ec5a0726028f226641e: 0.3780
-
-SEMANTIC DUPLICATE DETECTED: a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176
-Canonical article: 22d5628d2d11b697abc811a32011b9abccd26edcc0ff490fd339ebc5d011db39
-Similarity: 0.7254
-Duplicate headline: Tata Steel targets 15 million tonne downstream capacity after APL Apollo deal; analysts flag risks - CNBC TV18
-Canonical headline: Jamshedpur news:Tata Steel and Promoters of APL Apollo Enter into a Comprehensive Agreement to Build an Indian Steel Tubes and Colour Coated Products Powerhouse Targeting 15.5 Million Tonnes of Capacity - Bihar Jharkhand News Network
-Matched ticker(s): TATASTEEL
-Reason: Middle-zone event duplicate: shared ticker, within 24-hour window, cosine similarity 0.70-0.85, and shared event-context terms: apl, apollo, capacity, million, steel, tata
-
-UNIQUE ARTICLE: b1797a61220e3285f96a2020d793d9e9b3bebb514baa5ccf3f68a6e47992cbc8
-
-================================================
-          SILVER NEWS BATCH FAILED
-================================================
-Error: [FIELD_DATA_TYPE_UNACCEPTABLE_WITH_NAME] field time_window_hours: DoubleType() can not accept object 24 in type <class 'int'>.
-
-========== EXECUTION TIME SUMMARY ==========
-Checkpoint Recovery           :      0.06 seconds
-Read Bronze                   :      0.41 seconds
-Exact Deduplication           :      0.49 seconds
-Collect candidate IDs         :     16.19 seconds
-Validation                    :      0.26 seconds
-Valid record count action     :      0.40 seconds
-Invalid record count action   :      0.41 seconds
-HTML Cleaning                 :      0.26 seconds
-Ticker Extraction             :      0.17 seconds
-Semantic Deduplication        :      0.47 seconds
-TOTAL BATCH TIME              :     19.53 seconds
-============================================
-
-Batch failed; files remain uncheckpointed and will be retried.
-Retrying after 15 seconds. Error: [FIELD_DATA_TYPE_UNACCEPTABLE_WITH_NAME] field time_window_hours: DoubleType() can not accept object 24 in type <class 'int'>.
-
-Detected 2 new Bronze file(s). Checking file stability...
-
-
-================================================
-          STARTING SILVER NEWS BATCH
-================================================
-
-========== STEP 1: CHECKPOINT RECOVERY ==========
-
-========== CHECKPOINT RECOVERY ==========
-Committed batches recovered: 13
-Processed Bronze files: 29
-Processed article IDs: 57
-Checkpoint recovery completed.
-
-========== STEP 2: READ BRONZE ==========
-
-========== INCREMENTAL FILE CHECK ==========
-Total Bronze files: 14
-Previously processed files: 29
-New files to process: 2
-NEW: news_20261123T094045543120Z_3120ff53.parquet
-NEW: news_20261123T094045689772Z_52f3e827.parquet
-SKIPPED: news_20261118T062018498715Z_0678ba20.parquet
-SKIPPED: news_20261118T062018665286Z_11170060.parquet
-SKIPPED: news_20261119T065518299142Z_85c25b66.parquet
-SKIPPED: news_20261119T065518393195Z_2af22eaa.parquet
-SKIPPED: news_20261119T104533345690Z_d4cd305a.parquet
-SKIPPED: news_20261122T183624211207Z_798c195a.parquet
-SKIPPED: news_20261122T185131806721Z_10addeb7.parquet
-SKIPPED: news_20261123T051958242442Z_97443a77.parquet
-SKIPPED: news_20261123T051958321999Z_e64d1a5e.parquet
-SKIPPED: news_20261123T053521596007Z_890b5b1e.parquet
-SKIPPED: news_20261123T060610866827Z_fef97af4.parquet
-SKIPPED: news_20261123T062127085026Z_d0eceb64.parquet
-
-Reading: news_20261123T094045543120Z_3120ff53.parquet
-Records in file: 1
-
-Reading: news_20261123T094045689772Z_52f3e827.parquet
-Records in file: 1
-
-Total new Bronze records: 2
-New Bronze files: 2
- - news_20261123T094045543120Z_3120ff53.parquet
- - news_20261123T094045689772Z_52f3e827.parquet
-
-Batch ID: batch_3d6ef9aef0c2fd27
-
-========== STEP 3: EXACT DEDUPLICATION ==========
-
-========== ARTICLE-LEVEL DEDUPLICATION ==========
-Previously processed article IDs: 57
-
-Exact article-level deduplication transformations prepared.
-Previously processed IDs: 57
-Article-level deduplication completed!
-Records proceeding to validation: 2                                             
-
-========== STEP 4: VALIDATION ==========
-
-========== STARTING NEWS VALIDATION ==========
-
-Validation transformations completed; valid and invalid records are separated.
-Valid articles: 2
-Invalid articles: 0
-
-========== STEP 5: HTML CLEANING ==========
-
-========== STARTING HTML CLEANING ==========
-HTML cleaning completed.
-
-========== STEP 6: TICKER EXTRACTION ==========
-
-========== STARTING TICKER EXTRACTION ==========
-Number of companies loaded: 13
-Ticker extraction transformations prepared.
-
-========== STEP 7: SEMANTIC DEDUPLICATION ==========
-
-========== SEMANTIC DEDUPLICATION ==========
-Reusing in-memory historical Silver News cache: 56
-
-Preparing semantic comparison candidates...
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with 56aada9705765e4794ec70c2b3b80f8c3b3d67c2ffcb21227912835a2c26cc6a: 0.6871
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with 6e531a79a4b54d65abc6a0686211b7e17bbf3a074d72e5eb3a9e9db0c48008ea: 0.6195
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with 0734e0f33691fcb3fc842e8dfafc27592f0e5487452edeed52294bf1155617d4: 0.6149
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with 22d5628d2d11b697abc811a32011b9abccd26edcc0ff490fd339ebc5d011db39: 0.7254
-Comparing a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176 with bf0736d15cc8e4e7764a8084d70c5a9c876915172a598ec5a0726028f226641e: 0.3780
-
-SEMANTIC DUPLICATE DETECTED: a76d19c21c49a349345b553f718244708c9e7659ba1a3954c4985524fffc4176
-Canonical article: 22d5628d2d11b697abc811a32011b9abccd26edcc0ff490fd339ebc5d011db39
-Similarity: 0.7254
-Duplicate headline: Tata Steel targets 15 million tonne downstream capacity after APL Apollo deal; analysts flag risks - CNBC TV18
-Canonical headline: Jamshedpur news:Tata Steel and Promoters of APL Apollo Enter into a Comprehensive Agreement to Build an Indian Steel Tubes and Colour Coated Products Powerhouse Targeting 15.5 Million Tonnes of Capacity - Bihar Jharkhand News Network
-Matched ticker(s): TATASTEEL
-Reason: Middle-zone event duplicate: shared ticker, within 24-hour window, cosine similarity 0.70-0.85, and shared event-context terms: apl, apollo, capacity, million, steel, tata
-
-UNIQUE ARTICLE: b1797a61220e3285f96a2020d793d9e9b3bebb514baa5ccf3f68a6e47992cbc8
-
-================================================
-          SILVER NEWS BATCH FAILED
-================================================
-Error: [FIELD_DATA_TYPE_UNACCEPTABLE_WITH_NAME] field time_window_hours: DoubleType() can not accept object 24 in type <class 'int'>.
-
-========== EXECUTION TIME SUMMARY ==========
-Checkpoint Recovery           :      0.03 seconds
-Read Bronze                   :      0.22 seconds
-Exact Deduplication           :      0.30 seconds
-Collect candidate IDs         :     13.77 seconds
-Validation                    :      0.28 seconds
-Valid record count action     :      0.44 seconds
-Invalid record count action   :      0.42 seconds
-HTML Cleaning                 :      0.26 seconds
-Ticker Extraction             :      0.19 seconds
-Semantic Deduplication        :      0.72 seconds
-TOTAL BATCH TIME              :     16.99 seconds
-============================================
-
-Batch failed; files remain uncheckpointed and will be retried.
-Retrying after 15 seconds. Error: [FIELD_DATA_TYPE_UNACCEPTABLE_WITH_NAME] field time_window_hours: DoubleType() can not accept object 24 in type <class 'int'>.
-
-Detected 2 new Bronze file(s). Checking file stability...
-
-
-================================================
-          STARTING SILVER NEWS BATCH
-================================================
-
-========== STEP 1: CHECKPOINT RECOVERY ==========
-
-========== CHECKPOINT RECOVERY ==========
-Committed batches recovered: 13
-Processed Bronze files: 29
-Processed article IDs: 57
-Checkpoint recovery completed.
-
-========== STEP 2: READ BRONZE ==========
-
-========== INCREMENTAL FILE CHECK ==========
-Total Bronze files: 14
-Previously processed files: 29
-New files to process: 2
-NEW: news_20261123T094045543120Z_3120ff53.parquet
-NEW: news_20261123T094045689772Z_52f3e827.parquet
-SKIPPED: news_20261118T062018498715Z_0678ba20.parquet
-SKIPPED: news_20261118T062018665286Z_11170060.parquet
-SKIPPED: news_20261119T065518299142Z_85c25b66.parquet
-SKIPPED: news_20261119T065518393195Z_2af22eaa.parquet
-SKIPPED: news_20261119T104533345690Z_d4cd305a.parquet
-SKIPPED: news_20261122T183624211207Z_798c195a.parquet
-SKIPPED: news_20261122T185131806721Z_10addeb7.parquet
-SKIPPED: news_20261123T051958242442Z_97443a77.parquet
-SKIPPED: news_20261123T051958321999Z_e64d1a5e.parquet
-SKIPPED: news_20261123T053521596007Z_890b5b1e.parquet
-SKIPPED: news_20261123T060610866827Z_fef97af4.parquet
-SKIPPED: news_20261123T062127085026Z_d0eceb64.parquet
-
-Reading: news_20261123T094045543120Z_3120ff53.parquet
-Records in file: 1
-
-Reading: news_20261123T094045689772Z_52f3e827.parquet
-Records in file: 1
-
-Total new Bronze records: 2
-New Bronze files: 2
- - news_20261123T094045543120Z_3120ff53.parquet
- - news_20261123T094045689772Z_52f3e827.parquet
-
-Batch ID: batch_3d6ef9aef0c2fd27
-
-========== STEP 3: EXACT DEDUPLICATION ==========
-
-========== ARTICLE-LEVEL DEDUPLICATION ==========
-Previously processed article IDs: 57
-
-Exact article-level deduplication transformations prepared.
-Previously processed IDs: 57
-Article-level deduplication completed!
-ERROR:root:Exception while sending command.                         (2 + 2) / 4]
-Traceback (most recent call last):
-  File "C:\Users\2000209445\Desktop\FINTEL_UPDATE\.venv\Lib\site-packages\py4j\clientserver.py", line 535, in send_command
-    answer = smart_decode(self.stream.readline()[:-1])
-                          ^^^^^^^^^^^^^^^^^^^^^^
-RuntimeError: reentrant call inside <_io.BufferedReader name=1880>
-
-During handling of the above exception, another exception occurred:
-
-Traceback (most recent call last):
-  File "C:\Users\2000209445\Desktop\FINTEL_UPDATE\.venv\Lib\site-packages\py4j\java_gateway.py", line 1038, in send_command
-    response = connection.send_command(command)
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\2000209445\Desktop\FINTEL_UPDATE\.venv\Lib\site-packages\py4j\clientserver.py", line 566, in send_command
-    raise Py4JNetworkError(
-py4j.protocol.Py4JNetworkError: Error while sending or receiving
-ERROR:root:KeyboardInterrupt while sending command.
-Traceback (most recent call last):
-  File "C:\Users\2000209445\Desktop\FINTEL_UPDATE\.venv\Lib\site-packages\pyspark\core\context.py", line 407, in signal_handler
-    self.cancelAllJobs()
-  File "C:\Users\2000209445\Desktop\FINTEL_UPDATE\.venv\Lib\site-packages\pyspark\core\context.py", line 2506, in cancelAllJobs
-    self._jsc.sc().cancelAllJobs()
-    ^^^^^^^^^^^^^^
-  File "C:\Users\2000209445\Desktop\FINTEL_UPDATE\.venv\Lib\site-packages\py4j\java_gateway.py", line 1362, in __call__
-    return_value = get_return_value(
-                   ^^^^^^^^^^^^^^^^^
-  File "C:\Users\2000209445\Desktop\FINTEL_UPDATE\.venv\Lib\site-packages\pyspark\errors\exceptions\captured.py", line 256, in deco
-    return f(*a, **kw)
-           ^^^^^^^^^^^
-  File "C:\Users\2000209445\Desktop\FINTEL_UPDATE\.venv\Lib\site-packages\py4j\protocol.py", line 335, in get_return_value
-    raise Py4JError(
-py4j.protocol.Py4JError: An error occurred while calling o26.sc
-
-During handling of the above exception, another exception occurred:
-
-Traceback (most recent call last):
-  File "C:\Users\2000209445\Desktop\FINTEL_UPDATE\.venv\Lib\site-packages\py4j\java_gateway.py", line 1038, in send_command
-    response = connection.send_command(command)
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\2000209445\Desktop\FINTEL_UPDATE\.venv\Lib\site-packages\py4j\clientserver.py", line 535, in send_command
-    answer = smart_decode(self.stream.readline()[:-1])
-                          ^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Program Files\Python312\Lib\socket.py", line 707, in readinto
-    return self._sock.recv_into(b)
-           ^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\2000209445\Desktop\FINTEL_UPDATE\.venv\Lib\site-packages\pyspark\core\context.py", line 409, in signal_handler
-    raise KeyboardInterrupt()
-KeyboardInterrupt
-
-Ctrl+C received. Shutting down Silver service...
-Spark session stopped. Silver service shut down.
-java.util.concurrent.RejectedExecutionException: Task Future(<not completed>) rejected from java.util.concurrent.ThreadPoolExecutor@36c939f3[Shutting down, pool size = 57, active threads = 1, queued tasks = 0, completed tasks = 405]
-        at java.base/java.util.concurrent.ThreadPoolExecutor$AbortPolicy.rejectedExecution(ThreadPoolExecutor.java:2065)
-        at java.base/java.util.concurrent.ThreadPoolExecutor.reject(ThreadPoolExecutor.java:833)
-        at java.base/java.util.concurrent.ThreadPoolExecutor.execute(ThreadPoolExecutor.java:1365)
-        at scala.concurrent.impl.ExecutionContextImpl.execute(ExecutionContextImpl.scala:21)
-        at scala.concurrent.impl.Promise$Transformation.submitWithValue(Promise.scala:462)
-        at scala.concurrent.impl.Promise$DefaultPromise.submitWithValue(Promise.scala:371)
-        at scala.concurrent.impl.Promise$DefaultPromise.tryComplete0(Promise.scala:295)
-        at scala.concurrent.impl.Promise$Transformation.run(Promise.scala:537)
-        at scala.concurrent.ExecutionContext$parasitic$.execute(ExecutionContext.scala:222)
-        at scala.concurrent.impl.Promise$Transformation.submitWithValue(Promise.scala:462)
-        at scala.concurrent.impl.Promise$DefaultPromise.submitWithValue(Promise.scala:368)
-        at scala.concurrent.impl.Promise$DefaultPromise.tryComplete0(Promise.scala:295)
-        at scala.concurrent.impl.Promise$Transformation.handleFailure(Promise.scala:477)
-        at scala.concurrent.impl.Promise$Transformation.run(Promise.scala:539)
-        at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1136)
-        at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:635)
-        at java.base/java.lang.Thread.run(Thread.java:840)
-java.util.concurrent.RejectedExecutionException: Task Future(<not completed>) rejected from java.util.concurrent.ThreadPoolExecutor@36c939f3[Shutting down, pool size = 1, active threads = 1, queued tasks = 0, completed tasks = 405]
-        at java.base/java.util.concurrent.ThreadPoolExecutor$AbortPolicy.rejectedExecution(ThreadPoolExecutor.java:2065)
-        at java.base/java.util.concurrent.ThreadPoolExecutor.reject(ThreadPoolExecutor.java:833)
-        at java.base/java.util.concurrent.ThreadPoolExecutor.execute(ThreadPoolExecutor.java:1365)
-        at scala.concurrent.impl.ExecutionContextImpl.execute(ExecutionContextImpl.scala:21)
-        at scala.concurrent.impl.Promise$Transformation.submitWithValue(Promise.scala:462)
-        at scala.concurrent.impl.Promise$DefaultPromise.submitWithValue(Promise.scala:371)
-        at scala.concurrent.impl.Promise$DefaultPromise.tryComplete0(Promise.scala:295)
-        at scala.concurrent.impl.Promise$Transformation.handleFailure(Promise.scala:477)
-        at scala.concurrent.impl.Promise$Transformation.run(Promise.scala:539)
-        at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1136)
-        at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:635)
-        at java.base/java.lang.Thread.run(Thread.java:840)
-Terminate batch job (Y/N)? SUCCESS: The process with PID 7700 (child process of PID 8608) has been terminated.
-SUCCESS: The process with PID 8608 (child process of PID 3204) has been terminated.
-
-(.venv) C:\Users\2000209445\Desktop\FINTEL_UPDATE\silver_news\src>
+    print(
+        "[GOLD] Gold output:",
+        settings.GOLD_PATH
+    )
+
+    # -----------------------------------------------------
+    # 5. BUILD GOLD STREAM
+    # -----------------------------------------------------
+
+    gold = build_gold_stream(
+        ticks_raw,
+        news_raw
+    )
+
+    totals = {
+        "rows": 0
+    }
+
+    # -----------------------------------------------------
+    # 6. PROCESS EACH MICRO-BATCH
+    # -----------------------------------------------------
+
+    def process(batch_df, batch_id):
+
+        batch_df.persist()
+
+        try:
+
+            stats = batch_df.agg(
+
+                F.count("*").alias("n"),
+
+                F.min(
+                    "window_start"
+                ).alias("a"),
+
+                F.max(
+                    "window_end"
+                ).alias("b")
+
+            ).collect()[0]
+
+            _batch_outputs[batch_id] = (
+                int(stats["n"]),
+                stats["a"],
+                stats["b"]
+            )
+
+            if stats["n"] == 0:
+                return
+
+            # Write Gold output
+            write_batch(
+                batch_df,
+
+                settings.GOLD_PATH,
+
+                app_id="gold-sentiment-price",
+
+                batch_id=batch_id
+            )
+
+            totals["rows"] += stats["n"]
+
+            # Optional PostgreSQL copy
+            if settings.PG_ENABLED:
+
+                try:
+
+                    _postgres_upsert(
+                        [
+                            r.asDict()
+                            for r in batch_df.collect()
+                        ]
+                    )
+
+                except Exception as error:
+
+                    print(
+                        f"[GOLD] Postgres upsert skipped: {error}"
+                    )
+
+            # Pipeline heartbeat
+            audit.job_heartbeat(
+                run_id,
+                JOB,
+                totals["rows"]
+            )
+
+            print(
+                f"[GOLD] Batch {batch_id}: "
+                f"{stats['n']} window rows "
+                f"({stats['a']} .. {stats['b']})"
+            )
+
+        finally:
+
+            batch_df.unpersist()
+
+    # -----------------------------------------------------
+    # 7. REGISTER AUDIT LISTENER
+    # -----------------------------------------------------
+
+    spark.streams.addListener(
+        GoldProgressAudit(run_id)
+    )
+
+    # -----------------------------------------------------
+    # 8. START GOLD STREAM
+    # -----------------------------------------------------
+
+    query = (
+
+        gold.writeStream
+
+        .queryName(QUERY_NAME)
+
+        .outputMode("append")
+
+        .foreachBatch(process)
+
+        .option(
+            "checkpointLocation",
+            str(settings.GOLD_CHECKPOINT_PATH)
+        )
+
+        .trigger(
+            processingTime=settings.GOLD_TRIGGER
+        )
+
+        .start()
+    )
+
+    print("\n[GOLD] Streaming query started successfully.")
+
+    print(
+        "[GOLD] Query ID:",
+        query.id
+    )
+
+    return query
