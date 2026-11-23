@@ -1,4 +1,37 @@
+NEWS_SYMBOL_CANDIDATES = [
+    "matched_tickers",
+    "matched_ticker",
+    "symbol",
+    "ticker",
+    "stock_symbol",
+]
 
+NEWS_TIME_CANDIDATES = [
+    "published_at",
+    "publication_timestamp",
+    "news_time",
+    "published_time",
+    "ingested_at",
+]
+
+NEWS_SCORE_CANDIDATES = [
+    "sentiment_score",
+    "score",
+    "compound",
+]
+
+NEWS_LABEL_CANDIDATES = [
+    "sentiment_label",
+    "sentiment",
+    "label",
+    "sentiment_class",
+]
+
+NEWS_HEADLINE_CANDIDATES = [
+    "headline",
+    "title",
+    "news_title",
+]
 (.venv) C:\Users\2000209445\Desktop\FINTEL_UPDATE\silver_news>python -c "import pandas as pd,glob; fs=glob.glob('data/silver/news/**/*.parquet',recursive=True); d=pd.concat([pd.read_parquet(f,columns=['published_at','matched_tickers']) for f in fs],ignore_index=True); t=pd.to_datetime(d.published_at,utc=True,errors='coerce'); print('TOTAL ARTICLES:',len(d)); print('VALID TIMESTAMPS:',t.notna().sum()); print('OLDEST NEWS:',t.min()); print('LATEST NEWS:',t.max()); print('NEWS BY DATE:'); print(t.dt.date.value_counts().sort_index().to_string())"
 TOTAL ARTICLES: 57
 VALID TIMESTAMPS: 57
