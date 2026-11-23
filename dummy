@@ -1,0 +1,1 @@
+python -c "import glob, pyarrow.parquet as pq; files=glob.glob('data/silver/news/**/*.parquet', recursive=True); print('FILES:',len(files)); print('FIRST FILE:',files[0] if files else 'NONE'); print('SCHEMA:',pq.read_schema(files[0]) if files else 'No files')"
