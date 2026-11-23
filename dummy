@@ -1,1 +1,34 @@
-python -c "import pandas as pd,glob; fs=glob.glob('data/silver/news/**/*.parquet',recursive=True); d=pd.concat([pd.read_parquet(f,columns=['published_at','matched_tickers']) for f in fs],ignore_index=True); t=pd.to_datetime(d.published_at,utc=True,errors='coerce'); print('TOTAL ARTICLES:',len(d)); print('VALID TIMESTAMPS:',t.notna().sum()); print('OLDEST NEWS:',t.min()); print('LATEST NEWS:',t.max()); print('NEWS BY DATE:'); print(t.dt.date.value_counts().sort_index().to_string())"
+
+(.venv) C:\Users\2000209445\Desktop\FINTEL_UPDATE\silver_news>python -c "import pandas as pd,glob; fs=glob.glob('data/silver/news/**/*.parquet',recursive=True); d=pd.concat([pd.read_parquet(f,columns=['published_at','matched_tickers']) for f in fs],ignore_index=True); t=pd.to_datetime(d.published_at,utc=True,errors='coerce'); print('TOTAL ARTICLES:',len(d)); print('VALID TIMESTAMPS:',t.notna().sum()); print('OLDEST NEWS:',t.min()); print('LATEST NEWS:',t.max()); print('NEWS BY DATE:'); print(t.dt.date.value_counts().sort_index().to_string())"
+TOTAL ARTICLES: 57
+VALID TIMESTAMPS: 57
+OLDEST NEWS: 2026-06-08 07:00:00+00:00
+LATEST NEWS: 2026-11-23 07:53:28+00:00
+NEWS BY DATE:
+published_at
+2026-06-08    1
+2026-06-15    1
+2026-07-17    1
+2026-08-18    1
+2026-08-20    1
+2026-08-27    1
+2026-08-31    1
+2026-10-11    1
+2026-10-17    1
+2026-10-23    1
+2026-10-29    1
+2026-10-30    1
+2026-11-01    1
+2026-11-03    1
+2026-11-09    2
+2026-11-10    1
+2026-11-11    6
+2026-11-12    7
+2026-11-13    2
+2026-11-16    4
+2026-11-17    9
+2026-11-18    2
+2026-11-19    2
+2026-11-20    1
+2026-11-22    1
+2026-11-23    6
