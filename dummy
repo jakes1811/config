@@ -1,1 +1,24 @@
-python -c "import glob,pyarrow.parquet as pq; fs=glob.glob(r'..\Market_ticker\silver\data\stock_silver\**\*.parquet',recursive=True); fs=[f for f in fs if '_delta_log' not in f]; print('TOTAL FILES:',len(fs)); print('FIRST FILE:',fs[0] if fs else 'NONE'); print('SCHEMA:',pq.read_schema(fs[0]) if fs else 'No files')"
+(.venv) C:\Users\2000209445\Desktop\FINTEL_UPDATE\silver_news>python -c "import glob,pyarrow.parquet as pq; fs=glob.glob(r'..\Market_ticker\silver\data\stock_silver\**\*.parquet',recursive=True); fs=[f for f in fs if '_delta_log' not in f]; print('TOTAL FILES:',len(fs)); print('FIRST FILE:',fs[0] if fs else 'NONE'); print('SCHEMA:',pq.read_schema(fs[0]) if fs else 'No files')"
+TOTAL FILES: 145
+FIRST FILE: ..\Market_ticker\silver\data\stock_silver\part-00000-001f91a2-70b9-49b6-b4d0-2d708b24ea71-c000.snappy.parquet
+SCHEMA: tick_id: string
+symbol: string
+yahoo_symbol: string
+current_price: double
+change: double
+change_percent: double
+currency: string
+source: string
+market_timestamp: timestamp[ns]
+fetched_timestamp: timestamp[ns]
+publication_timestamp: timestamp[ns]
+silver_ingested_at: timestamp[ns]
+topic: string
+partition: int32
+offset: int64
+kafka_timestamp: timestamp[ns]
+kafka_key: string
+raw_json: string
+-- schema metadata --
+org.apache.spark.version: '4.1.1'
+org.apache.spark.sql.parquet.row.metadata: '{"type":"struct","fields":[{"' + 1253
